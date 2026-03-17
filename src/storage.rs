@@ -88,8 +88,9 @@ impl Storage {
         let path = self.session_file(upload_id);
         let json = fs::read_to_string(&path)
             .await
-            .with_context(|| format!("Session {upload_id} not found"))?;
-        serde_json::from_str(&json).context("Failed to parse session.json")
+            .with_context(|| format!("Session '{upload_id}' not found — create a new upload"))?;
+        serde_json::from_str(&json)
+            .with_context(|| format!("Session '{upload_id}' is in an incompatible format — create a new upload"))
     }
 
     // ── Metadata JSON ─────────────────────────────────────────────────────────
@@ -166,6 +167,17 @@ impl Storage {
         }
         out_file.flush().await?;
         Ok(sizes)
+    }
+
+    /// Delete session.json — called after upload completes so the plaintext
+    /// symmetric key no longer lives on disk. Everything needed for download
+    /// is in metadata.json (ECIES-wrapped; private key is only in the URL).
+    pub async fn delete_session(&self, upload_id: &str) -> Result<()> {
+        let path = self.session_file(upload_id);
+        if path.exists() {
+            fs::remove_file(&path).await.context("Failed to delete session.json")?;
+        }
+        Ok(())
     }
 
     /// Delete the temporary chunk directory for a file (after assembly).

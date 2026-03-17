@@ -6,9 +6,22 @@ pub struct AppError(pub anyhow::Error);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let status = StatusCode::INTERNAL_SERVER_ERROR;
-        let body = Json(json!({"error": self.0.to_string()}));
-        (status, body).into_response()
+        let msg = self.0.to_string();
+        // Classify: client errors (bad input / missing session) → 400, server faults → 500
+        let status = if msg.contains("not found")
+            || msg.contains("not registered")
+            || msg.contains("incompatible format")
+            || msg.contains("Invalid")
+            || msg.contains("wrong length")
+            || msg.contains("missing chunks")
+            || msg.contains("already completed")
+        {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("handler error: {:?}", self.0);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, Json(json!({"error": msg}))).into_response()
     }
 }
 

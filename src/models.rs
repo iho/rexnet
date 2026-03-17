@@ -50,7 +50,12 @@ pub struct EciesEnvelope {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DownloadMetadata {
     pub upload_id: String,
+    /// Symmetric key wrapped with the per-upload X25519 keypair. Private key goes in the URL.
     pub ecies: EciesEnvelope,
+    /// Symmetric key also wrapped with the master X25519 public key, if one is configured.
+    /// Admins holding the master private key can decrypt any upload with this envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ecies_master: Option<EciesEnvelope>,
     pub files: Vec<DownloadFileMetadata>,
 }
 
@@ -74,6 +79,14 @@ pub struct CreateUploadRequest {
 pub struct CreateUploadResponse {
     pub upload_id: String,
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteUploadRequest {
+    /// Maps sanitized filename → client-computed SHA-256 hex of the plaintext.
+    /// Optional — if omitted, no hash is stored (dedup won't work for this upload).
+    #[serde(default)]
+    pub file_hashes: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]

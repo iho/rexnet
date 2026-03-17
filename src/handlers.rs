@@ -2,8 +2,8 @@ use crate::{
     crypto,
     error::AppError,
     models::{
-        ChunkUploadResponse, CreateUploadRequest, CreateUploadResponse, DownloadFileMetadata,
-        DownloadMetadata, EciesEnvelope, SessionFileState, UploadSession,
+        ChunkUploadResponse, CompleteUploadRequest, CreateUploadRequest, CreateUploadResponse,
+        DownloadFileMetadata, DownloadMetadata, EciesEnvelope, SessionFileState, UploadSession,
     },
     AppState,
 };
@@ -129,11 +129,12 @@ pub async fn upload_chunk(
     body: Bytes,
 ) -> Result<Json<ChunkUploadResponse>, AppError> {
     // Parse required headers
-    let filename = headers
-        .get("X-Filename")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError(anyhow::anyhow!("Missing X-Filename header")))?
-        .to_string();
+    let filename = percent_decode(
+        headers
+            .get("X-Filename")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| AppError(anyhow::anyhow!("Missing X-Filename header")))?,
+    );
 
     let chunk_index: u32 = headers
         .get("X-Chunk-Index")
@@ -260,7 +261,9 @@ pub async fn upload_chunk(
 pub async fn complete_upload(
     Path(upload_id): Path<String>,
     State(state): State<AppState>,
+    body: Option<Json<CompleteUploadRequest>>,
 ) -> Result<Response, AppError> {
+    let file_hashes = body.map(|b| b.0.file_hashes).unwrap_or_default();
     let mut session = state.storage.load_session(&upload_id).await?;
 
     if session.status == "complete" {
@@ -312,6 +315,19 @@ pub async fn complete_upload(
 
     let (eph_pub, nonce, ciphertext) = crypto::ecies_wrap(&sym_key, &static_public)?;
 
+    // Optionally wrap again with the master public key for admin escrow
+    let ecies_master = state
+        .master_public_key
+        .map(|master_pub| -> Result<EciesEnvelope, AppError> {
+            let (eph_pub, nonce, ciphertext) = crypto::ecies_wrap(&sym_key, &master_pub)?;
+            Ok(EciesEnvelope {
+                eph_pub_b62: crypto::bytes_to_base62(&eph_pub),
+                nonce_b62: crypto::bytes_to_base62(&nonce),
+                ciphertext_b62: crypto::bytes_to_base62(&ciphertext),
+            })
+        })
+        .transpose()?;
+
     // Save download metadata
     let metadata = DownloadMetadata {
         upload_id: upload_id.clone(),
@@ -320,6 +336,7 @@ pub async fn complete_upload(
             nonce_b62: crypto::bytes_to_base62(&nonce),
             ciphertext_b62: crypto::bytes_to_base62(&ciphertext),
         },
+        ecies_master,
         files: download_files.clone(),
     };
     state.storage.save_metadata(&metadata).await?;
@@ -336,11 +353,10 @@ pub async fn complete_upload(
     // Clean up temp directory
     state.storage.cleanup_temp(&upload_id).await?;
 
-    // Mark session complete
-    session.status = "complete".to_string();
-    // Clear private key from session (it's now embedded in the download URL)
-    session.x25519_private_b62 = "[redacted]".to_string();
-    state.storage.save_session(&session).await?;
+    // Delete session.json — it contained the plaintext symmetric key.
+    // Everything needed for download is now in metadata.json (ECIES-wrapped).
+    // The private key is only in the download URL given to the user — never on disk.
+    state.storage.delete_session(&upload_id).await?;
 
     info!("Upload {upload_id} completed successfully");
 
@@ -350,10 +366,20 @@ pub async fn complete_upload(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Build a JSON object mapping hash → download_url for the browser to cache in localStorage.
+    // Only include hashes that are valid 64-char hex strings.
+    let cache_entries: Vec<String> = file_hashes
+        .values()
+        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|h| format!("\"{}\":\"{}\"", h, download_url.replace('"', "")))
+        .collect();
+    let hash_cache_json = format!("{{{}}}", cache_entries.join(","));
+
     let html = SUCCESS_HTML
         .replace("{{UPLOAD_ID}}", &upload_id)
         .replace("{{DOWNLOAD_URL}}", &download_url)
-        .replace("{{FILE_LIST}}", &file_list);
+        .replace("{{FILE_LIST}}", &file_list)
+        .replace("{{HASH_CACHE_JSON}}", &hash_cache_json);
 
     Ok(Html(html).into_response())
 }
@@ -363,6 +389,21 @@ pub async fn complete_upload(
 #[derive(Deserialize)]
 pub struct DownloadQuery {
     pub key: String,
+}
+
+/// Decode an EciesEnvelope and unwrap the symmetric key using the given private key.
+fn ecies_unwrap_envelope(
+    private_key: &[u8; 32],
+    env: &crate::models::EciesEnvelope,
+) -> anyhow::Result<[u8; 32]> {
+    let eph_pub: [u8; 32] = crypto::bytes_from_base62(&env.eph_pub_b62)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("eph_pub wrong length"))?;
+    let nonce: [u8; 24] = crypto::bytes_from_base62(&env.nonce_b62)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("nonce wrong length"))?;
+    let ciphertext = crypto::bytes_from_base62(&env.ciphertext_b62)?;
+    crypto::ecies_unwrap(private_key, &eph_pub, &nonce, &ciphertext)
 }
 
 /// Download and decrypt files for an upload session.
@@ -389,21 +430,18 @@ pub async fn download(
     // Load metadata
     let metadata = state.storage.load_metadata(&upload_id).await?;
 
-    // Decode ECIES envelope fields
-    let eph_pub_bytes = crypto::bytes_from_base62(&metadata.ecies.eph_pub_b62)?;
-    let eph_pub: [u8; 32] = eph_pub_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("eph_pub has wrong length"))?;
-
-    let nonce_bytes = crypto::bytes_from_base62(&metadata.ecies.nonce_b62)?;
-    let nonce: [u8; 24] = nonce_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("nonce has wrong length"))?;
-
-    let ciphertext = crypto::bytes_from_base62(&metadata.ecies.ciphertext_b62)?;
-
-    // Unwrap symmetric key via ECIES (ECDH + HKDF + XChaCha20-Poly1305 decrypt)
-    let sym_key_bytes = crypto::ecies_unwrap(&private_key, &eph_pub, &nonce, &ciphertext)?;
+    // Try to unwrap the symmetric key using the provided private key.
+    // We try the per-upload envelope first; if that fails, try the master envelope.
+    // This transparently handles both regular user keys and admin master keys.
+    let sym_key_bytes = ecies_unwrap_envelope(&private_key, &metadata.ecies)
+        .or_else(|_| {
+            metadata
+                .ecies_master
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Invalid key"))
+                .and_then(|master_env| ecies_unwrap_envelope(&private_key, master_env))
+        })
+        .map_err(|_| AppError(anyhow::anyhow!("Invalid key — decryption failed")))?;
 
     if metadata.files.len() == 1 {
         // Single file — stream decrypted bytes directly
@@ -472,9 +510,12 @@ async fn stream_single_file(
     let stream = ReaderStream::new(rx);
     let body = Body::from_stream(stream);
 
+    // Use RFC 5987 encoding for the filename so Unicode characters (Cyrillic, CJK, emoji, etc.)
+    // are preserved. The filename* parameter takes precedence over filename in modern browsers.
     let disposition = format!(
-        "attachment; filename=\"{}\"",
-        sanitize_header(&filename)
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        sanitize_header(&filename),
+        utf8_percent_encode(&filename)
     );
 
     Ok(Response::builder()
@@ -567,6 +608,28 @@ async fn stream_multi_file_zip(
 
 // ── HTML helpers ─────────────────────────────────────────────────────────────
 
+/// Decode a percent-encoded string (as produced by JS `encodeURIComponent`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h1), Some(h2)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push((h1 * 16 + h2) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -574,10 +637,25 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// ASCII fallback for the `filename=` part of Content-Disposition.
 fn sanitize_header(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_graphic() && c != '"' { c } else { '_' })
         .collect()
+}
+
+/// Percent-encode a filename for RFC 5987 `filename*=UTF-8''...` parameter.
+/// Only unreserved characters (A-Za-z0-9 - _ . ~) are left unencoded.
+fn utf8_percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+            b => { out.push('%'); out.push_str(&format!("{b:02X}")); }
+        }
+    }
+    out
 }
 
 // ── Static HTML ───────────────────────────────────────────────────────────────
@@ -649,6 +727,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
 
 <script>
 const CHUNK_SIZE = 20 * 1024 * 1024; // 20 MB per chunk
+const HASH_SLICE = 64 * 1024 * 1024; // 64 MB slices for hashing large files
 let selectedFiles = [];
 
 // ── Drag & Drop ──────────────────────────────────────────────────────────────
@@ -678,6 +757,29 @@ function handleFiles(fileList) {
   document.getElementById('upload-btn').classList.toggle('hidden', selectedFiles.length === 0);
 }
 
+// ── Hashing ───────────────────────────────────────────────────────────────────
+// Hash a file in 64 MB slices to avoid loading large files fully into RAM.
+// For multi-slice files we hash each slice then hash the concatenated slice-hashes
+// (consistent Merkle-style fingerprint, deterministic for our client).
+async function hashFile(file) {
+  const sliceCount = Math.ceil(file.size / HASH_SLICE) || 1;
+  if (sliceCount === 1) {
+    const buf = await file.arrayBuffer();
+    return hexBuf(await crypto.subtle.digest('SHA-256', buf));
+  }
+  const sliceHashes = new Uint8Array(sliceCount * 32);
+  for (let i = 0; i < sliceCount; i++) {
+    const buf = await file.slice(i * HASH_SLICE, (i + 1) * HASH_SLICE).arrayBuffer();
+    const h = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+    sliceHashes.set(h, i * 32);
+  }
+  return hexBuf(await crypto.subtle.digest('SHA-256', sliceHashes));
+}
+
+function hexBuf(buf) {
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ── Upload ────────────────────────────────────────────────────────────────────
 async function startUpload() {
   if (!selectedFiles.length) return;
@@ -686,14 +788,58 @@ async function startUpload() {
   btn.disabled = true;
   btn.textContent = 'Encrypting & uploading\u2026';
 
-  showProgress('Creating secure session\u2026', 0);
+  // ── Step 1: Hash all files ────────────────────────────────────────────────
+  showProgress('Computing file fingerprints\u2026', 0);
+  const fileHashes = {}; // filename -> sha256 hex
+  for (let i = 0; i < selectedFiles.length; i++) {
+    const f = selectedFiles[i];
+    showProgress(`Fingerprinting ${f.name}\u2026`, Math.round((i / selectedFiles.length) * 10));
+    try {
+      fileHashes[f.name] = await hashFile(f);
+    } catch (_) {
+      // Hashing failed (e.g. memory pressure on huge file) — proceed without dedup for this file
+    }
+  }
 
-  const filenames = selectedFiles.map(f => f.name);
+  // ── Step 2: Check localStorage cache for known hashes ────────────────────
+  // Keys and download URLs are never stored server-side — only in the browser
+  // that performed the upload. This keeps the server disk clean of any secrets.
+  let knownHashes = {}; // hash -> download_url
+  try {
+    knownHashes = JSON.parse(localStorage.getItem('secureshare_cache') || '{}');
+  } catch (_) {}
 
-  // Check localStorage for a previous session we can resume
+  // Classify files: duplicate (already on server) vs new (need uploading)
+  const duplicates = []; // { name, url }
+  const toUpload = []; // File objects
+  for (const f of selectedFiles) {
+    const hash = fileHashes[f.name];
+    if (hash && knownHashes[hash]) {
+      duplicates.push({ name: f.name, url: knownHashes[hash] });
+    } else {
+      toUpload.push(f);
+    }
+  }
+
+  // If every file is a duplicate, show existing links immediately
+  if (toUpload.length === 0) {
+    showProgress('All files already uploaded!', 100);
+    setStatus(`${duplicates.length} duplicate${duplicates.length > 1 ? 's' : ''} found — no upload needed.`);
+    renderDuplicates(duplicates);
+    btn.disabled = false;
+    btn.textContent = 'Upload & Encrypt';
+    return;
+  }
+
+  if (duplicates.length > 0) {
+    setStatus(`${duplicates.length} file(s) already exist on server — uploading ${toUpload.length} new file(s).`);
+  }
+
+  // ── Step 3: Create / resume upload session for new files only ─────────────
+  const filenames = toUpload.map(f => f.name);
   const resumeKey = 'secureshare_resume_' + filenames.slice().sort().join('|');
   let uploadId = null;
-  let chunkProgress = {}; // filename -> last completed chunk index
+  let chunkProgress = {};
 
   const saved = localStorage.getItem(resumeKey);
   if (saved) {
@@ -702,10 +848,9 @@ async function startUpload() {
       uploadId = parsed.uploadId;
       chunkProgress = parsed.chunkProgress || {};
       setStatus(`Resuming previous session ${uploadId}`);
-    } catch (_) { /* ignore corrupt data */ }
+    } catch (_) {}
   }
 
-  // Create new session if needed
   if (!uploadId) {
     try {
       const resp = await fetch('/api/uploads', {
@@ -727,31 +872,19 @@ async function startUpload() {
 
   setStatus(`Session: ${uploadId}`);
 
-  // Upload all files
+  // ── Step 4: Upload chunks ─────────────────────────────────────────────────
   let totalChunks = 0;
   let completedChunks = 0;
+  for (const f of toUpload) totalChunks += Math.ceil(f.size / CHUNK_SIZE);
+  for (const fn_ of Object.keys(chunkProgress)) completedChunks += chunkProgress[fn_] + 1;
 
-  // Pre-calculate total chunks
-  for (const f of selectedFiles) {
-    totalChunks += Math.ceil(f.size / CHUNK_SIZE);
-  }
-  // Subtract already-completed chunks from resume
-  for (const fn_ of Object.keys(chunkProgress)) {
-    completedChunks += chunkProgress[fn_] + 1;
-  }
-
-  for (const file of selectedFiles) {
+  for (const file of toUpload) {
     const numChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const startChunk = (chunkProgress[file.name] !== undefined)
-      ? chunkProgress[file.name] + 1
-      : 0;
+    const startChunk = chunkProgress[file.name] !== undefined ? chunkProgress[file.name] + 1 : 0;
 
     for (let i = startChunk; i < numChunks; i++) {
-      const start = i * CHUNK_SIZE;
-      const chunk = file.slice(start, start + CHUNK_SIZE);
-      const chunkBytes = await chunk.arrayBuffer();
-
-      const pct = Math.round((completedChunks / totalChunks) * 100);
+      const chunkBytes = await file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE).arrayBuffer();
+      const pct = 10 + Math.round((completedChunks / totalChunks) * 89);
       showProgress(`Uploading ${file.name} \u2014 chunk ${i+1}/${numChunks}`, pct);
 
       let ok = false;
@@ -760,19 +893,25 @@ async function startUpload() {
           const resp = await fetch(`/api/uploads/${uploadId}/chunks`, {
             method: 'POST',
             headers: {
-              'X-Filename': file.name,
+              'X-Filename': encodeURIComponent(file.name),
               'X-Chunk-Index': String(i),
               'X-Total-Chunks': String(numChunks),
               'Content-Type': 'application/octet-stream',
             },
             body: chunkBytes,
           });
+          if (resp.status === 400) {
+            localStorage.removeItem(resumeKey);
+            setStatus('Session expired — restarting upload\u2026');
+            await sleep(500);
+            return startUpload();
+          }
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           ok = true;
           break;
         } catch (err) {
           setStatus(`Chunk ${i} attempt ${attempt+1} failed: ${err.message} \u2014 retrying\u2026`);
-          await sleep(1000 * Math.pow(2, attempt)); // exponential backoff
+          await sleep(1000 * Math.pow(2, attempt));
         }
       }
       if (!ok) {
@@ -781,17 +920,25 @@ async function startUpload() {
         btn.textContent = 'Retry Upload';
         return;
       }
-
       completedChunks++;
       chunkProgress[file.name] = i;
       localStorage.setItem(resumeKey, JSON.stringify({ uploadId, chunkProgress }));
     }
   }
 
-  // Complete the upload
+  // ── Step 5: Complete upload, sending file hashes for future dedup ──────────
   showProgress('Finalising encryption\u2026', 99);
   try {
-    const resp = await fetch(`/api/uploads/${uploadId}/complete`, { method: 'POST' });
+    // Only send hashes for files that were actually uploaded in this session
+    const sessionHashes = {};
+    for (const f of toUpload) {
+      if (fileHashes[f.name]) sessionHashes[f.name] = fileHashes[f.name];
+    }
+    const resp = await fetch(`/api/uploads/${uploadId}/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_hashes: sessionHashes }),
+    });
     if (!resp.ok) throw new Error(`Complete failed: ${resp.status}`);
     const html = await resp.text();
     localStorage.removeItem(resumeKey);
@@ -803,6 +950,20 @@ async function startUpload() {
     btn.disabled = false;
     btn.textContent = 'Retry';
   }
+}
+
+// Render a list of duplicate files with their existing download links
+function renderDuplicates(duplicates) {
+  const section = document.getElementById('progress-section');
+  section.classList.remove('hidden');
+  const existing = duplicates.map(d =>
+    `<div class="bg-gray-900 border border-gray-700 rounded-xl p-4 mb-3 text-left">
+      <p class="text-xs text-gray-500 mb-1">Already uploaded: <strong class="text-gray-300">${escHtml(d.name)}</strong></p>
+      <a href="${escHtml(d.url)}" class="text-blue-400 text-xs break-all hover:underline">${escHtml(d.url)}</a>
+      <button onclick="navigator.clipboard.writeText('${escHtml(d.url)}')" class="ml-2 text-xs text-gray-500 hover:text-gray-300">&#x1F4CB;</button>
+    </div>`
+  ).join('');
+  section.insertAdjacentHTML('afterend', existing);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -879,6 +1040,17 @@ static SUCCESS_HTML: &str = r#"<!DOCTYPE html>
   <p id="copy-msg" class="text-green-400 text-sm mt-3 opacity-0 transition-opacity">Link copied!</p>
 </div>
 <script>
+// Save hash → download_url to localStorage so future uploads of the same
+// files are detected as duplicates without any server-side key storage.
+(function() {
+  const entries = {{HASH_CACHE_JSON}};
+  try {
+    const cache = JSON.parse(localStorage.getItem('secureshare_cache') || '{}');
+    Object.assign(cache, entries);
+    localStorage.setItem('secureshare_cache', JSON.stringify(cache));
+  } catch(_) {}
+})();
+
 function copyLink() {
   navigator.clipboard.writeText(document.getElementById('dl-link').href)
     .then(() => {
