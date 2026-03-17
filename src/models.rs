@@ -10,10 +10,10 @@ pub struct UploadSession {
     pub status: String,
     /// 32-byte XChaCha20-Poly1305 key, base64url-encoded
     pub sym_key_b64: String,
-    /// RSA-4096 public key in PEM (PKCS#8 SubjectPublicKeyInfo format)
-    pub public_key_pem: String,
-    /// RSA-4096 private key in PEM (PKCS#8 format) — deleted/moved after complete
-    pub private_key_pem: String,
+    /// X25519 static public key, base62-encoded (32 bytes → ~43 chars)
+    pub x25519_public_b62: String,
+    /// X25519 static private key, base62-encoded — returned to user in download URL at complete
+    pub x25519_private_b62: String,
     /// Per-file upload state, keyed by sanitized filename
     pub files: HashMap<String, SessionFileState>,
     /// Unix timestamp seconds
@@ -33,13 +33,24 @@ pub struct SessionFileState {
     pub chunk_sizes: Vec<Option<u64>>,
 }
 
+/// ECIES envelope stored in metadata.json. Contains everything needed to recover
+/// the symmetric key given the X25519 static private key from the URL.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EciesEnvelope {
+    /// Ephemeral X25519 public key used during wrap (32 bytes → ~43 base62 chars)
+    pub eph_pub_b62: String,
+    /// XChaCha20-Poly1305 nonce for key wrapping (24 bytes → ~32 base62 chars)
+    pub nonce_b62: String,
+    /// Encrypted symmetric key + 16-byte Poly1305 tag (48 bytes → ~65 base62 chars)
+    pub ciphertext_b62: String,
+}
+
 /// Written to uploads/{uuid}/metadata.json after upload completion.
 /// This is what the download endpoint reads.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DownloadMetadata {
     pub upload_id: String,
-    /// RSA-4096-OAEP-SHA512 wrapped 32-byte symmetric key, base64url-encoded
-    pub wrapped_key_b64: String,
+    pub ecies: EciesEnvelope,
     pub files: Vec<DownloadFileMetadata>,
 }
 

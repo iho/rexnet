@@ -3,7 +3,7 @@ use crate::{
     error::AppError,
     models::{
         ChunkUploadResponse, CreateUploadRequest, CreateUploadResponse, DownloadFileMetadata,
-        DownloadMetadata, SessionFileState, UploadSession,
+        DownloadMetadata, EciesEnvelope, SessionFileState, UploadSession,
     },
     AppState,
 };
@@ -64,21 +64,13 @@ pub async fn create_upload(
 
     let upload_id = Uuid::new_v4().to_string();
 
-    // Generate RSA-4096 keypair (slow: 1-3 seconds, run in blocking thread)
-    info!("Generating RSA-4096 keypair for upload {upload_id}...");
-    let (private_key, public_key) =
-        tokio::task::spawn_blocking(crypto::generate_rsa_keypair)
-            .await
-            .map_err(|e| AppError(anyhow::anyhow!("Join error: {e}")))??;
-    info!("RSA-4096 keypair generated for upload {upload_id}");
+    // Generate X25519 keypair — instantaneous (no blocking needed)
+    let (x25519_private, x25519_public) = crypto::generate_x25519_keypair();
+    info!("Session {upload_id} created with X25519 keypair");
 
     // Generate per-session symmetric key
     let sym_key = crypto::generate_sym_key();
     let sym_key_b64 = STANDARD.encode(sym_key);
-
-    // Serialize keys to PEM
-    let public_key_pem = crypto::public_key_to_pem(&public_key)?;
-    let private_key_pem = crypto::private_key_to_pem(&private_key)?;
 
     // Build per-file state (nonce seeds assigned now, total_chunks set later)
     let files: HashMap<String, SessionFileState> = filenames
@@ -99,8 +91,8 @@ pub async fn create_upload(
         upload_id: upload_id.clone(),
         status: "ready".to_string(),
         sym_key_b64,
-        public_key_pem,
-        private_key_pem,
+        x25519_public_b62: crypto::bytes_to_base62(&x25519_public),
+        x25519_private_b62: crypto::bytes_to_base62(&x25519_private),
         files,
         created_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -307,32 +299,33 @@ pub async fn complete_upload(
         });
     }
 
-    // Wrap symmetric key with RSA public key
+    // Wrap symmetric key using ECIES (X25519 ECDH + HKDF + XChaCha20-Poly1305)
     let sym_key_bytes = STANDARD.decode(&session.sym_key_b64)?;
     let sym_key: [u8; 32] = sym_key_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("sym_key wrong length"))?;
 
-    let public_key = crypto::public_key_from_pem(&session.public_key_pem)?;
-    let wrapped_key = tokio::task::spawn_blocking(move || {
-        crypto::wrap_sym_key(&sym_key, &public_key)
-    })
-    .await
-    .map_err(|e| AppError(anyhow::anyhow!("Join error: {e}")))??;
+    let static_public_bytes = crypto::bytes_from_base62(&session.x25519_public_b62)?;
+    let static_public: [u8; 32] = static_public_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("x25519 public key wrong length"))?;
 
-    let wrapped_key_b64 = STANDARD.encode(&wrapped_key);
+    let (eph_pub, nonce, ciphertext) = crypto::ecies_wrap(&sym_key, &static_public)?;
 
     // Save download metadata
     let metadata = DownloadMetadata {
         upload_id: upload_id.clone(),
-        wrapped_key_b64,
+        ecies: EciesEnvelope {
+            eph_pub_b62: crypto::bytes_to_base62(&eph_pub),
+            nonce_b62: crypto::bytes_to_base62(&nonce),
+            ciphertext_b62: crypto::bytes_to_base62(&ciphertext),
+        },
         files: download_files.clone(),
     };
     state.storage.save_metadata(&metadata).await?;
 
-    // Encode private key as base62 [0-9A-Za-z] for a clean, all-alphanumeric URL
-    let private_key = crypto::private_key_from_pem(&session.private_key_pem)?;
-    let private_key_b62 = crypto::private_key_to_base62(&private_key)?;
+    // The download key is the X25519 static private key — already base62, 43 chars
+    let private_key_b62 = session.x25519_private_b62.clone();
 
     // Build download link using the configured base URL (e.g. https://rexnet.horobets.dev)
     let download_url = format!(
@@ -345,8 +338,8 @@ pub async fn complete_upload(
 
     // Mark session complete
     session.status = "complete".to_string();
-    // Clear private key from session for security (it's now in the URL)
-    session.private_key_pem = "[REDACTED - key returned to user]".to_string();
+    // Clear private key from session (it's now embedded in the download URL)
+    session.x25519_private_b62 = "[redacted]".to_string();
     state.storage.save_session(&session).await?;
 
     info!("Upload {upload_id} completed successfully");
@@ -386,20 +379,31 @@ pub async fn download(
     Query(q): Query<DownloadQuery>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
-    // Decode private key from base62 URL parameter
-    let private_key = crypto::private_key_from_base62(&q.key)
-        .map_err(|e| AppError(anyhow::anyhow!("Invalid private key in URL: {e}")))?;
+    // Decode X25519 static private key (43 base62 chars → 32 bytes)
+    let private_key_bytes = crypto::bytes_from_base62(&q.key)
+        .map_err(|e| AppError(anyhow::anyhow!("Invalid key in URL: {e}")))?;
+    let private_key: [u8; 32] = private_key_bytes
+        .try_into()
+        .map_err(|_| AppError(anyhow::anyhow!("Key has wrong length (expected 32 bytes)")))?;
 
     // Load metadata
     let metadata = state.storage.load_metadata(&upload_id).await?;
 
-    // Unwrap symmetric key
-    let wrapped_key = STANDARD.decode(&metadata.wrapped_key_b64)?;
-    let sym_key_bytes = tokio::task::spawn_blocking(move || {
-        crypto::unwrap_sym_key(&wrapped_key, &private_key)
-    })
-    .await
-    .map_err(|e| AppError(anyhow::anyhow!("Join error: {e}")))??;
+    // Decode ECIES envelope fields
+    let eph_pub_bytes = crypto::bytes_from_base62(&metadata.ecies.eph_pub_b62)?;
+    let eph_pub: [u8; 32] = eph_pub_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("eph_pub has wrong length"))?;
+
+    let nonce_bytes = crypto::bytes_from_base62(&metadata.ecies.nonce_b62)?;
+    let nonce: [u8; 24] = nonce_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("nonce has wrong length"))?;
+
+    let ciphertext = crypto::bytes_from_base62(&metadata.ecies.ciphertext_b62)?;
+
+    // Unwrap symmetric key via ECIES (ECDH + HKDF + XChaCha20-Poly1305 decrypt)
+    let sym_key_bytes = crypto::ecies_unwrap(&private_key, &eph_pub, &nonce, &ciphertext)?;
 
     if metadata.files.len() == 1 {
         // Single file — stream decrypted bytes directly
@@ -596,7 +600,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
 <div class="w-full max-w-2xl">
   <div class="text-center mb-8">
     <h1 class="text-4xl font-bold text-white mb-2">&#x1F510; SecureShare</h1>
-    <p class="text-gray-400">XChaCha20-Poly1305 + RSA-4096 encrypted. No size limit. Resumable.</p>
+    <p class="text-gray-400">XChaCha20-Poly1305 + X25519 ECIES encrypted. No size limit. Resumable.</p>
   </div>
 
   <!-- Drop Zone -->
@@ -633,13 +637,13 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
 
   <!-- Encryption badge -->
   <div class="mt-8 flex items-center justify-center gap-4 text-xs text-gray-600">
-    <span>&#x1F511; RSA-4096-OAEP-SHA512</span>
+    <span>&#x1F511; X25519 ECIES</span>
     <span>&bull;</span>
     <span>&#x26A1; XChaCha20-Poly1305</span>
     <span>&bull;</span>
     <span>&#x1F9E9; Resumable chunks</span>
     <span>&bull;</span>
-    <span>&#x30; Zero server logging of content</span>
+    <span>&#x1F510; HKDF-SHA256</span>
   </div>
 </div>
 
@@ -682,7 +686,7 @@ async function startUpload() {
   btn.disabled = true;
   btn.textContent = 'Encrypting & uploading\u2026';
 
-  showProgress('Creating secure session (RSA-4096, ~2s)\u2026', 0);
+  showProgress('Creating secure session\u2026', 0);
 
   const filenames = selectedFiles.map(f => f.name);
 
