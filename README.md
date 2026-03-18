@@ -139,6 +139,7 @@ WantedBy=multi-user.target
 
 ```nginx
 server {
+    access_log off;
     listen 443 ssl;
     server_name rexnet.horobets.dev;
 
